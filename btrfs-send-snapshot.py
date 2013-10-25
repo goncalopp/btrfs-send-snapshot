@@ -2,110 +2,186 @@
 
 '''
 This script uses btrfs send/receive to send snapshots to a remote host.
-It assumes all snapshots are in the same directory, and their alphabetical order is
-the order in which they were created.
-This works well together with https://github.com/mmehnert/btrfs-snapshot-rotation .
+It does this by:
+    Creating a new subvolume on the remote host
+    sending the btrfs send stream to the remote subvolume
+    snapshotting the subvolume in the remote host
+Assumptions:
+    all snapshots are in the same directory, both on local and remote side
+    all snapshots in those directories are to be synchronized
+    snapshot alphabetical order is the order in which they were created
+    
+This works well together with https://github.com/mmehnert/btrfs-snapshot-rotation.
+snapshots on the remote side that don't exist on the local side (because
+they were rotated) can be deleted with delete_unmatching_remote_snaps()
 '''
 
-LAST_SYNC_FILE= '/home/goncalopp/btrfs_last_sync'          #A file that contains the name of the last successfuly sinced snapshot
-LOCK_FILE= '/home/goncalopp/btrfs_lockfile'                #A lock file to prevent multiple running processes, or running after critical error
-LOCAL_SNAP_DIR= '/home/goncalopp/tmp1/snapshots'    #The local directory where btrfs snapshots are kept 
-REMOTE_HOST='localhost'                             #the hostname or IP of the remote host
-REMOTE_SNAP_DIR= '/home/goncalopp/tmp2/snapshots'    #The remote directory where btrfs snapshots are kept
-REMOTE_SUBVOLUME_PATH= '/home/goncalopp/tmp2/rootfs' #The remote path of the btrfs subvolume where the snapshot will be written
+LOCK_FILE= '/home/test/btrfs_lockfile'                #A lock file to prevent multiple running processes, or running after critical error
+LOCAL_SNAP_DIR= '/home/test/tmp1/snapshots'    #The local directory where btrfs snapshots are kept 
+REMOTE_SNAP_DIR= '/home/test/tmp2/snapshots'    #The remote directory where btrfs snapshots are kept
+REMOTE_SUBVOLUME_PATH= '/home/test/tmp2/rootfs' #The remote path of the btrfs subvolume where the snapshot will be written
+
 
 import os
 import subprocess
 import logging
+from fabric.api import *
+from fabric.contrib import files
+from fabric.state import default_channel
+
 logging.basicConfig(level=logging.DEBUG)
+
+class cached(object):    
+    '''Computes attribute value and caches it in the instance.
+    Python Cookbook (Denis Otkidach) http://stackoverflow.com/users/168352/denis-otkidach
+    '''
+    def __init__(self, method, name=None):
+        self.method = method
+        self.name = name or method.__name__
+        self.__doc__ = method.__doc__
+    def __get__(self, inst, cls):  
+        if inst is None:
+            return self
+        result = self.method(inst)
+        setattr(inst, self.name, result)
+        return result
 
 def rformat( string, kwargs ):
     '''formats a string multiple times as needed.'''
     f= string.format(**kwargs)
     return f if f==string else rformat(f, kwargs)
-    
-def execute_command(command, check=True):
-    logging.debug("executing "+command)
-    p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = p.communicate()
-    separator="-----------------------------------------------------------\n"
-    logging.debug("command output: "+str(out)+"--\n"+str(err))
-    if check and p.returncode!=0:
-        logging.warn("command output: \n"+separator+str(out)+separator+str(err)+separator)
-        raise Exception("Process returned "+str(p.returncode))
 
-def send_snapshot_to_subvol( local_snap_path, remote_host, remote_subvol_path, local_delta_snap_path=None, compress=True):
-    '''sends a snapshot to a subvolume'''
+def remote_pipe(local_command, remote_command, buf_size=1024):
+    '''executes a local command and a remove command (with fabric), and 
+    sends the local's stdout to the remote's stdin'''
+    local_p= subprocess.Popen(local_command, shell=True, stdout=subprocess.PIPE)
+    channel= default_channel() #fabric function
+    channel.exec_command( remote_command )
+    read_bytes= local_p.stdout.read(buf_size)
+    while read_bytes:
+        channel.send(read_bytes)
+    local_ret= local_p.wait()
+    channel.shutdown_write()
+    remote_ret= recv_exit_status(self)
+    if local_ret!=0 or remote_ret!=0:
+        raise Exception("remote_pipe failed")
+
+def send_snapshot_to_remote_subvol( local_snap_path, remote_subvol_path, local_delta_snap_path=None, compress=True):
+    '''sends a snapshot to a remote subvolume'''
     lsp, rsp, ldsp= local_snap_path, remote_subvol_path, local_delta_snap_path
-    ssh= "ssh {remote_host}"
     parent= "-p {ldsp}" if ldsp else ""
     ssc= "/sbin/btrfs send {parent} {lsp}" if ldsp else "btrfs send {lsp}" #send stream command
     rsc= "/sbin/btrfs receive {rsp}" #receive stream command
     if compress:
             ssc+= " | gzip"
             rsc= "gzip -d | " + rsc
-    command= rformat("{ssc} | {ssh} '{rsc}'", locals())
-    execute_command(command)
+    ssc= rformat(ssc, locals())
+    rsc= rformat(rsc, locals())
+    remote_pipe( ssc, rsc )
     
 
-def snapshot_subvolume( remote_host, remote_subvol_path, remote_snap_path, writable=True):
-    ssh= "ssh {remote_host}"
+def snapshot_remote_subvolume( remote_subvol_path, remote_snap_path, writable=True):
+    '''snapshots a remote subvolume'''
     ro= "" if writable else "-r "
-    command= "{ssh} '/sbin/btrfs subvol snap {ro}{remote_subvol_path} {remote_snap_path}'"
-    execute_command(rformat(command,locals()))
+    command= "/sbin/btrfs subvol snap {ro}{remote_subvol_path} {remote_snap_path}"
+    run(command.format(**locals()))
 
-def prepare_remote_subvol(remote_host, remote_subvol_path, remote_snap_dir, base=None):
-    '''makes sure the remote subvolume is a writable subvolume. 
-    If base is given, it will make sure that the subvolume is a 
-    unmodified writable snapshot of the subvolume base. Otherwise, 
-    make sure that that it's empty'''
-    ssh= "ssh {remote_host}"
-    execute_command( rformat("{ssh} '/sbin/btrfs subvol del {remote_subvol_path}'", locals()), check=False )
+def delete_remote_subvolume( remote_subvol_path ):
+    run("sbin/btrfs subvol del "+remote_subvol_path)
+
+def prepare_remote_subvol(remote_subvol_path, remote_snap_dir, base=None):
+    '''If base is None, creates a empty subvolume.
+    If base is given, a snapshot of base is created instead.'''
+    if files.exists(remote_subvol_path):
+        delete_subvolume( remote_subvol_path )
     if base:
-        snapshot_subvolume( remote_host, remote_snap_dir, remote_subvol_path, base )
+        snapshot_subvolume(remote_snap_dir, remote_subvol_path, base )
     else:
-        execute_command( rformat("{ssh} '/sbin/btrfs subvol create {remote_subvol_path}'", locals()))
+        run("/sbin/btrfs subvol create"+remote_subvol_path)
+
+
+class BtrfsSnapshotSender( object ):
+    def __init__(self, lock_file, local_snap_dir, remote_snap_dir, remote_subvol_path):
+        self.lock_file, self.local_snap_dir, self.remote_snap_dir, self.remote_subvol_path= lock_file, local_snap_dir, remote_snap_dir, remote_subvol_path
+        self._open_lockfile()
     
-def open_logfile():
-    if os.path.exists(LOCK_FILE):
-        print "Previous transfer still running, or interrupted. Exiting"
-        exit(1)
-    open(LOCK_FILE, 'w').close()
+    def __del__(self):
+        self._close_lockfile()
 
-def critical_error(error, message):
-    print message
-    exit(error)
+    def _open_lockfile(self):
+        if os.path.exists(self.lock_file):
+            raise Exception("Previous transfer still running, or interrupted. Exiting")
+        open(self.lock_file, 'w').close()
 
-def get_last_synced_snapshot():
-    return open(LAST_SYNC_FILE).read() if os.path.exists(LAST_SYNC_FILE) else None
+    def _close_lockfile(self):
+        os.remove(self.lock_file)
 
-def get_local_snapshots():
-    return sorted(os.listdir(LOCAL_SNAP_DIR))
+    @cached
+    def _local_snapshots(self):
+        snaps= sorted(os.listdir(LOCAL_SNAP_DIR))
+        logging.debug("local snapshots: "+",".join(snaps))
+        return snaps
+    
+    @cached
+    def _remote_snapshots(self):
+        ssh= "ssh {self.remote_host}"
+        command="{ssh} ls"
+        snaps= sorted(execute_command(rformat(command)))
+        logging.debug("remote snapshots: "+",".join(snaps))
+        return snaps
+    
+    def _local_remote_sets(self):
+        return set(self._local_snapshots),set(self._local_snapshots)
+    
+    def _missing_snapshots(self):
+        '''snapshots that only exist on the local side'''
+        local, remote= self._local_remote_sets()
+        missing= sorted(local-remote)
+        logging.debug("missing snapshots: "+",".join(missing))
+        return missing
+    
+    def _sync_snapshot( self, snap, delta=None ):
+        logging.debug("syncing "+snap+(" with delta "+delta if delta else ""))
+        local_snap= os.path.join( self.local_snap_dir, snap)
+        remote_snap= os.path.join( self.remote_snap_dir, snap)
+        delta_snap= os.path.join(self.local_snap_dir, delta) if delta else None
+        send_snapshot_to_remote_subvol( local_snap, self.remote_subvol_path, delta_snap )
+        snapshot_remote_subvolume( self.remote_subvol_path, remote_snap)
+        _remote_snapshots.append(snap)
+        
+    def _sync_snapshots(self, snapshots, delta=None):
+        prepare_remote_subvol(self.remote_subvol_path, remote_snap_dir, delta)
+        for snap in snapshots:
+            self._sync_snapshot(snap, delta)
+            delta=snap #delta of next snapshot is the current one
+    
+    def delete_unmatching_remote_snaps(self):
+        '''deletes snapshots on remote host that don't exist on local host'''
+        local, remote= self._local_remote_sets()
+        unmatching= remote-local
+        logging.warning("deleting unmatching snapshots: "+",".join(unmatching))
+        for snap in unmatching:
+            delete_remote_subvolume( os.path.join( self.remote_snap_dir, snap) )
+    
+    def sync_one(self):
+        '''Sends the next missing snapshot to the remote. 
+        Returns the name of the synced snapshot, or None if there's 
+        nothing missing'''
+        missing= self._missing_snapshots()
+        if not missing:
+            logging.debug("nothing missing")
+            return None
+        snap= missing[0] #first missing snapshot
+        self._sync_snapshot( snap )
+    
+    def sync_all(self):
+        '''Sends all the missing snapshots to the remote. 
+        Returns the names of the synced snapshots'''
+        missing= self._missing_snapshots()
+        if not missing:
+            logging.debug("nothing missing")
+            return None
+        self._sync_snapshots( missing )
 
-open_logfile()
-local_snaps= get_local_snapshots()
-logging.debug("Existing snapshots: "+";".join(local_snaps))
-if not local_snaps:
-    critical_error(2,"No snapshots on the local folder")
-last_sync= get_last_synced_snapshot()
-logging.debug("Last sync: "+str(last_sync))
-try:
-    last_sync_i= local_snaps.index(last_sync) if last_sync else -1
-except ValueError:
-    critical_error(3, "The last synced snapshot doesn't exist")
-synced_snapshots= local_snaps[:last_sync_i+1]
-unsynced_snapshots= local_snaps[last_sync_i+1:]
-logging.debug("Already synced: "+str(synced_snapshots))
-logging.debug("Not yet synced: "+str(unsynced_snapshots))
-
-if unsynced_snapshots:
-    prepare_remote_subvol(REMOTE_HOST, REMOTE_SUBVOLUME_PATH, REMOTE_SNAP_DIR, last_sync)
-for syncing_snap in unsynced_snapshots:
-    logging.info("Syncing snapshot: "+syncing_snap+ (" delta from " + last_sync if last_sync else ""))
-    local_snap=    os.path.join(LOCAL_SNAP_DIR,  syncing_snap)
-    delta_snap=    os.path.join(LOCAL_SNAP_DIR,  last_sync   ) if last_sync else None
-    remote_snap=   os.path.join(REMOTE_SNAP_DIR, syncing_snap)
-    send_snapshot_to_subvol(local_snap, REMOTE_HOST, REMOTE_SUBVOLUME_PATH, last_sync)
-    snapshot_subvolume(REMOTE_HOST, REMOTE_SUBVOLUME_PATH, remote_snap, writable=False)
-    open(LAST_SYNC_FILE, 'w').write(syncing_snap)
-os.remove(LOCK_FILE)
+sender= BtrfsSnapshotSender(LOCK_FILE, LOCAL_SNAP_DIR, REMOTE_SNAP_DIR, REMOTE_SUBVOLUME_PATH)
+sender.sync_one()
