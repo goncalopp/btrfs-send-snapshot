@@ -98,7 +98,6 @@ class SnapshotLists(object):
         self.remote_dir= remote_dir
         self.refresh_local()
         self.refresh_remote()
-        self.missing_remote= sorted(self.local_set-self.remote_set)
         log.debug("remote missing snapshots: "+"\n\t"+"\n\t".join(self.missing_remote))
 
     def _local_snapshots(self):
@@ -114,12 +113,6 @@ class SnapshotLists(object):
         log.debug("remote snapshots: "+"\n\t"+"\n\t".join(snaps))
         return snaps
 
-    def add_remote(self, snap):
-        '''manually add a remote snapshot as existing'''
-        self.remote.append( snap )
-        self.remote.sort()
-        self.remote_set|=set(snap)
-
     def refresh_local(self):
         self.local=  self._local_snapshots()
         self.local_set=  set(self.local)
@@ -127,6 +120,7 @@ class SnapshotLists(object):
     def refresh_remote(self):
         self.remote= self._remote_snapshots()
         self.remote_set= set(self.remote)
+        self.missing_remote= sorted(self.local_set-self.remote_set)
 
     def get_local_path( self, snap ):
         assert snap in self.local_set
@@ -171,13 +165,14 @@ class BtrfsSnapshotSender( object ):
         remote= self.lists.remote_dir
         delta=  self.lists.get_local_path(  delta ) if delta else None
         send_snapshot_to_remote( local, remote, delta )
-        self.lists.add_remote(snap)
+        self.lists.refresh_remote()
 
     def delete_unmatching_remote_snaps(self):
         '''deletes snapshots on remote host that don't exist on local host'''
-        log.warning("deleting unmatching snapshots: "+",".join(self.lists.missing_remote))
+        unmatching= self.lists.remote_set - self.lists.local_set
+        log.warning("deleting unmatching snapshots: "+"\n\t"+"\n\t".join(unmatching))
         for snap in unmatching:
-            delete_remote_subvolume( map(lists.remote_path, self.lists.missing_remote) )
+            delete_remote_subvolume( lists.remote_path(snap) ) 
 
     def sync_one(self):
         '''Sends the next missing snapshot to the remote.
@@ -199,6 +194,7 @@ class BtrfsSnapshotSender( object ):
         while synced:
             done.append(synced)
             synced= self.sync_one()
+        return synced
 
 if __name__=="__main__":
     from fabric.state import output
