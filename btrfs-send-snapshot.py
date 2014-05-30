@@ -160,12 +160,15 @@ class BtrfsSnapshotSender( object ):
         os.remove(self.lock_file)
 
     def _sync_snapshot( self, snap, delta=None ):
+        assert snap in self.lists.local_set
+        assert snap not in self.lists.remote_set
         log.info("syncing "+snap+(" with delta "+delta if delta else ""))
         local=  self.lists.get_local_path(  snap )
         remote= self.lists.remote_dir
         delta=  self.lists.get_local_path(  delta ) if delta else None
         send_snapshot_to_remote( local, remote, delta )
         self.lists.refresh_remote()
+        assert snap in self.lists.remote_set
 
     def delete_unmatching_remote_snaps(self):
         '''deletes snapshots on remote host that don't exist on local host'''
