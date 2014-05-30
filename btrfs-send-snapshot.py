@@ -164,9 +164,18 @@ class BtrfsSnapshotSender( object ):
         assert snap not in self.lists.remote_set
         log.info("syncing "+snap+(" with delta "+delta if delta else ""))
         local=  self.lists.get_local_path(  snap )
-        remote= self.lists.remote_dir
         delta=  self.lists.get_local_path(  delta ) if delta else None
-        send_snapshot_to_remote( local, remote, delta )
+        try:
+            send_snapshot_to_remote( local, self.lists.remote_dir, delta )
+        except:
+            log.error("An error occurred while syncing "+snap)
+            self.lists.refresh_remote()
+            if snap in self.lists.remote_set:
+                log.error("Deleting partially transferred snapshot "+snap)
+                delete_remote_subvolume( lists.remote_path(snap) )
+            self.lists.refresh_remote()
+            assert not snap in self.lists.remote_set
+            raise
         self.lists.refresh_remote()
         assert snap in self.lists.remote_set
 
