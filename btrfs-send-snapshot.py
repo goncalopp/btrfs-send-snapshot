@@ -30,7 +30,7 @@ from fabric.state import default_channel
 
 log= logging.getLogger(__name__)
 log.addHandler( logging.StreamHandler(sys.stdout) )
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.INFO)
 
 
 
@@ -62,7 +62,7 @@ def remote_pipe(local_command, remote_command, buf_size=1024*1024):
     channel.shutdown_read()
     remote_ret= channel.recv_exit_status()
     if local_ret!=0 or remote_ret!=0:
-        raise Exception("remote_pipe failed: {0} {1} {2}".format(local_ret, remote_ret, received))
+        raise Exception("remote_pipe failed. Local retcode: {0} Remote retcode: {1}  output: {2}".format(local_ret, remote_ret, received))
 
 def send_snapshot_to_remote( local_snap_path, remote_snap_path, local_delta_snap_path=None, compress=False, progress=True):
     '''sends a snapshot to a remote subvolume'''
@@ -99,11 +99,11 @@ class SnapshotLists(object):
         self.refresh_local()
         self.refresh_remote()
         self.missing_remote= sorted(self.local_set-self.remote_set)
-        log.debug("remote missing snapshots: "+",".join(self.missing_remote))
+        log.debug("remote missing snapshots: "+"\n\t"+"\n\t".join(self.missing_remote))
 
     def _local_snapshots(self):
         snaps= sorted(os.listdir(LOCAL_SNAP_DIR))
-        log.debug("local snapshots:  "+",".join(snaps))
+        log.debug("local snapshots:  "+"\n\t"+"\n\t".join(snaps))
         return snaps
 
     def _remote_snapshots(self):
@@ -111,7 +111,7 @@ class SnapshotLists(object):
         snaps= run(command)
         snaps= snaps.split("\r\n") if "\r\n" in snaps else snaps.split("\n")
         snaps.sort()
-        log.debug("remote snapshots: "+",".join(snaps))
+        log.debug("remote snapshots: "+"\n\t"+"\n\t".join(snaps))
         return snaps
 
     def add_remote(self, snap):
