@@ -216,4 +216,4 @@ if __name__=="__main__":
     env.hosts=env.all_hosts= [REMOTE_HOST]
     with settings(host_string=REMOTE_HOST):
         sender= BtrfsSnapshotSender(LOCK_FILE, LOCAL_SNAP_DIR, REMOTE_SNAP_DIR)
-        sender.sync_one() 
+        sender.sync_all() 
